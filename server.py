@@ -1,99 +1,123 @@
 import socket
+import select
 import threading
-
-# 1. Base de datos prefabricada de usuarios
-DB_USUARIOS = {
-    "ernesto": "1234",
-    "fede": "pass1",
-    "edu": "pass2",
-    "admin": "admin"
-}
+import db
 
 # Diccionario para guardar los clientes autenticados: {socket_del_cliente: "nombre_de_usuario"}
 clientes_activos = {}
-lock_clientes = threading.Lock() # Evita errores si dos clientes se conectan a la vez
+# Lista de todos los sockets de clientes conectados (autenticados o no)
+sockets_conectados = []
 
 def broadcast(mensaje, remitente_socket=None):
-    """Envía un mensaje a todos los clientes conectados, excepto al remitente."""
-    with lock_clientes:
-        for cliente_sock in clientes_activos:
-            if cliente_sock != remitente_socket:
-                try:
-                    cliente_sock.sendall(mensaje.encode('utf-8'))
-                except Exception:
-                    pass # El cliente se desconectó repentinamente
+    """Envía un mensaje a todos los clientes AUTENTICADOS, excepto al remitente."""
+    for cliente_sock in list(clientes_activos.keys()):
+        if cliente_sock != remitente_socket:
+            try:
+                cliente_sock.sendall(mensaje.encode('utf-8'))
+            except Exception:
+                desconectar_cliente(cliente_sock)
 
-def manejar_cliente(client_socket, addr):
-    """Maneja la autenticación y la recepción de mensajes de un cliente."""
-    print(f"[NUEVA CONEXIÓN] {addr} conectando...")
-    
-    # --- FASE DE AUTENTICACIÓN ---
+def desconectar_cliente(sock):
+    """Maneja la desconexión de un cliente de forma segura."""
+    if sock in sockets_conectados:
+        sockets_conectados.remove(sock)
+    if sock in clientes_activos:
+        usuario = clientes_activos[sock]
+        del clientes_activos[sock]
+        broadcast(f"[SISTEMA] {usuario} ha abandonado el chat.")
+        print(f"[DESCONEXIÓN] {usuario} se ha ido.")
     try:
-        client_socket.sendall(b"AUTH_REQ: Bienvenido. Por favor, ingresa tu usuario:")
-        usuario_ingresado = client_socket.recv(1024).decode('utf-8').strip()
-        
-        if usuario_ingresado in DB_USUARIOS:
-            client_socket.sendall(b"AUTH_SUCCESS: Autenticacion exitosa. Ya puedes chatear.")
-            with lock_clientes:
-                clientes_activos[client_socket] = usuario_ingresado
-            
-            print(f"[AUTH OK] {usuario_ingresado} ({addr}) ha entrado al chat.")
-            broadcast(f"[SISTEMA] {usuario_ingresado} se ha unido al chat.")
-        else:
-            client_socket.sendall(b"AUTH_FAIL: Usuario no registrado. Desconectando...")
-            print(f"[AUTH FALLIDA] {addr} intento entrar como '{usuario_ingresado}'.")
-            client_socket.close()
-            return # Terminamos el hilo para este cliente
-            
-    except Exception as e:
-        client_socket.close()
-        return
-
-    # --- FASE DE CHAT ---
-    try:
-        while True:
-            mensaje = client_socket.recv(1024).decode('utf-8')
-            
-            if not mensaje or mensaje == '/salir':
-                break
-                
-            # Verificar si es el comando /all
-            if mensaje.startswith("/all "):
-                # Extraemos el contenido quitando los primeros 5 caracteres ("/all ")
-                contenido = mensaje[5:]
-                mensaje_formateado = f"[{usuario_ingresado} a todos]: {contenido}"
-                print(f"[BROADCAST] {mensaje_formateado}")
-                broadcast(mensaje_formateado, remitente_socket=client_socket)
-            else:
-                # Comportamiento por defecto (mensaje privado al server)
-                client_socket.sendall(f"Server recibió en privado: {mensaje}".encode('utf-8'))
-
-    except ConnectionResetError:
+        sock.close()
+    except:
         pass
-    finally:
-        with lock_clientes:
-            if client_socket in clientes_activos:
-                usuario = clientes_activos[client_socket]
-                del clientes_activos[client_socket]
-                broadcast(f"[SISTEMA] {usuario} ha abandonado el chat.")
-                print(f"[DESCONEXIÓN] {usuario} ({addr}) se ha ido.")
-        client_socket.close()
 
 def comandos_servidor():
     """Hilo dedicado a escuchar los comandos que tipeamos en la consola del servidor."""
     while True:
-        comando = input()
-        if comando == '/all-users':
-            print("\n--- BASE DE DATOS DE USUARIOS ---")
-            for user in DB_USUARIOS.keys():
-                print(f"- {user}")
-            print("---------------------------------\n")
+        try:
+            comando = input()
+            if comando == '/all-users':
+                print("\n--- BASE DE DATOS DE USUARIOS ---")
+                usuarios = db.get_all_users()
+                if usuarios:
+                    for user in usuarios:
+                        print(f"- {user}")
+                else:
+                    print("No hay usuarios registrados o error de DB.")
+                print("---------------------------------\n")
+        except EOFError:
+            break
+
+def manejar_datos_cliente(sock):
+    """Procesa los datos recibidos de un socket."""
+    try:
+        data = sock.recv(1024)
+        if not data:
+            desconectar_cliente(sock)
+            return
+
+        mensaje = data.decode('utf-8').strip()
+        if not mensaje:
+            return
+
+        # Si el usuario ya está autenticado
+        if sock in clientes_activos:
+            usuario = clientes_activos[sock]
+            if mensaje == '/salir':
+                desconectar_cliente(sock)
+            elif mensaje.startswith("/all "):
+                contenido = mensaje[5:]
+                mensaje_formateado = f"[{usuario} a todos]: {contenido}"
+                print(f"[BROADCAST] {mensaje_formateado}")
+                broadcast(mensaje_formateado, remitente_socket=sock)
+            else:
+                sock.sendall(f"Server recibió en privado: {mensaje}".encode('utf-8'))
+        else:
+            # Cliente NO autenticado, esperar /login o /register
+            if mensaje.startswith("/register "):
+                partes = mensaje.split(" ")
+                if len(partes) >= 3:
+                    u = partes[1]
+                    p = " ".join(partes[2:])
+                    success, msg = db.register_user(u, p)
+                    sock.sendall(f"REGISTER_RES: {msg}".encode('utf-8'))
+                else:
+                    sock.sendall(b"ERROR: Formato incorrecto. Uso: /register <usuario> <password>")
+            elif mensaje.startswith("/login "):
+                partes = mensaje.split(" ")
+                if len(partes) >= 3:
+                    u = partes[1]
+                    p = " ".join(partes[2:])
+                    success, msg = db.authenticate_user(u, p)
+                    if success:
+                        sock.sendall(b"AUTH_SUCCESS: Autenticacion exitosa. Ya puedes chatear con /all <mensaje>.")
+                        clientes_activos[sock] = u
+                        print(f"[AUTH OK] {u} ha entrado al chat.")
+                        broadcast(f"[SISTEMA] {u} se ha unido al chat.")
+                    else:
+                        sock.sendall(f"AUTH_FAIL: {msg}".encode('utf-8'))
+                else:
+                    sock.sendall(b"ERROR: Formato incorrecto. Uso: /login <usuario> <password>")
+            elif mensaje == '/salir':
+                desconectar_cliente(sock)
+            else:
+                sock.sendall(b"AUTH_REQ: Debes autenticarte. Uso: /login <user> <pass> o /register <user> <pass>")
+
+    except ConnectionResetError:
+        desconectar_cliente(sock)
+    except Exception as e:
+        print(f"[ERROR MANEJANDO CLIENTE] {e}")
+        desconectar_cliente(sock)
 
 def iniciar_servidor():
     HOST = "127.0.0.1"
     PORT = 12345
 
+    # Inicializar la base de datos si es necesario
+    db.init_db()
+
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind((HOST, PORT))
     server_socket.listen(5)
     print(f'[ESCUCHANDO] Servidor activo en {HOST}:{PORT}')
@@ -102,10 +126,35 @@ def iniciar_servidor():
     hilo_comandos = threading.Thread(target=comandos_servidor, daemon=True)
     hilo_comandos.start()
 
-    while True:
-        conn, addr = server_socket.accept()
-        thread = threading.Thread(target=manejar_cliente, args=(conn, addr))
-        thread.start()
+    sockets_conectados.append(server_socket)
+
+    try:
+        while True:
+            # select.select toma (listas_de_lectura, listas_de_escritura, listas_de_errores)
+            # Retorna los sockets que están listos para ser procesados
+            leer_sockets, _, errores_sockets = select.select(sockets_conectados, [], sockets_conectados)
+
+            for sock in leer_sockets:
+                # Si el socket listo es el servidor, significa que hay una nueva conexión
+                if sock == server_socket:
+                    client_socket, addr = server_socket.accept()
+                    print(f"[NUEVA CONEXIÓN] {addr} conectando...")
+                    sockets_conectados.append(client_socket)
+                    # Enviar mensaje automático de autenticación obligatorio al conectar
+                    client_socket.sendall(b"AUTH_REQ: Bienvenido. Por favor ingresa /login <user> <pass> o /register <user> <pass>")
+                else:
+                    # Es un socket de cliente enviando datos
+                    manejar_datos_cliente(sock)
+
+            for sock in errores_sockets:
+                desconectar_cliente(sock)
+
+    except KeyboardInterrupt:
+        print("\n[APAGANDO] Servidor cerrándose...")
+    finally:
+        for s in sockets_conectados:
+            s.close()
+        server_socket.close()
 
 if __name__ == "__main__":
     iniciar_servidor()

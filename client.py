@@ -29,27 +29,9 @@ def iniciar_cliente():
         print("[ERROR] El servidor no está activo.")
         return
 
-    # --- FASE DE AUTENTICACIÓN (Síncrona) ---
-    # Escuchamos el primer mensaje del server
-    respuesta_inicial = s.recv(1024).decode('utf-8')
-    print(f"Servidor: {respuesta_inicial}")
-    
-    if "AUTH_REQ" in respuesta_inicial:
-        usuario = input("Tu usuario: ")
-        s.sendall(usuario.encode('utf-8'))
-        
-        # Esperamos el veredicto del server
-        veredicto = s.recv(1024).decode('utf-8')
-        print(f"Servidor: {veredicto}")
-        
-        if "AUTH_FAIL" in veredicto:
-            s.close()
-            return
+    print("Conectado al servidor.")
 
-    print("\n--- CHAT MULTIJUGADOR INICIADO ---")
-    print("Comandos: '/all [mensaje]' para grupo | '/salir' para salir\n")
-
-    # --- FASE DE CHAT (Asíncrona multihilo) ---
+    # --- FASE DE CHAT Y AUTENTICACION (Asíncrona multihilo) ---
     # Lanzamos el hilo de recepción en modo daemon (muere si se cierra el programa)
     hilo_escucha = threading.Thread(target=recibir_mensajes, args=(s,), daemon=True)
     hilo_escucha.start()
