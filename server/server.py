@@ -1,7 +1,7 @@
 import socket
 import select
 import threading
-import db
+from database import db
 
 # Diccionario para guardar los clientes autenticados: {socket_del_cliente: "nombre_de_usuario"}
 clientes_activos = {}
@@ -35,7 +35,7 @@ def comandos_servidor():
     """Hilo dedicado a escuchar los comandos que tipeamos en la consola del servidor."""
     while True:
         try:
-            comando = input()
+            comando = input().strip()
             if comando == '/all-users':
                 print("\n--- BASE DE DATOS DE USUARIOS ---")
                 usuarios = db.get_all_users()
@@ -43,10 +43,17 @@ def comandos_servidor():
                     for user in usuarios:
                         print(f"- {user}")
                 else:
-                    print("No hay usuarios registrados o error de DB.")
+                    print("No hay usuarios registrados.")
                 print("---------------------------------\n")
         except EOFError:
             break
+
+def auth(client_socket):
+    """Función de autenticación que se ejecuta de forma automática al conectarse un nuevo cliente."""
+    try:
+        client_socket.sendall(b"AUTH_REQ: Bienvenido. Por favor ingresa /login <user> <pass> o /register <user> <pass>")
+    except Exception as e:
+        print(f"[ERROR AUTH SEND] {e}")
 
 def manejar_datos_cliente(sock):
     """Procesa los datos recibidos de un socket."""
@@ -65,6 +72,12 @@ def manejar_datos_cliente(sock):
             usuario = clientes_activos[sock]
             if mensaje == '/salir':
                 desconectar_cliente(sock)
+            elif mensaje == '/logout':
+                del clientes_activos[sock]
+                broadcast(f"[SISTEMA] {usuario} ha cerrado sesión.")
+                print(f"[AUTH LOGOUT] {usuario} cerró sesión.")
+                sock.sendall(b"LOGOUT_SUCCESS: Has cerrado sesion exitosamente. Por favor, logueate o registrate de nuevo.")
+                auth(sock)
             elif mensaje.startswith("/all "):
                 contenido = mensaje[5:]
                 mensaje_formateado = f"[{usuario} a todos]: {contenido}"
@@ -79,8 +92,18 @@ def manejar_datos_cliente(sock):
                 if len(partes) >= 3:
                     u = partes[1]
                     p = " ".join(partes[2:])
-                    success, msg = db.register_user(u, p)
-                    sock.sendall(f"REGISTER_RES: {msg}".encode('utf-8'))
+                    # Comprobar si ya hay un usuario activo con el mismo nombre
+                    if u in clientes_activos.values():
+                        sock.sendall(b"REGISTER_FAIL: El usuario ya ha iniciado sesion desde otro cliente.")
+                    else:
+                        success, msg = db.register_user(u, p)
+                        if success:
+                            clientes_activos[sock] = u
+                            sock.sendall(f"REGISTER_SUCCESS: {msg}\nAUTH_SUCCESS: Autenticacion automatica exitosa. Ya puedes chatear con /all <mensaje>.".encode('utf-8'))
+                            print(f"[AUTH OK] {u} ha entrado al chat (auto-login tras registro).")
+                            broadcast(f"[SISTEMA] {u} se ha unido al chat.")
+                        else:
+                            sock.sendall(f"REGISTER_FAIL: {msg}".encode('utf-8'))
                 else:
                     sock.sendall(b"ERROR: Formato incorrecto. Uso: /register <usuario> <password>")
             elif mensaje.startswith("/login "):
@@ -88,14 +111,18 @@ def manejar_datos_cliente(sock):
                 if len(partes) >= 3:
                     u = partes[1]
                     p = " ".join(partes[2:])
-                    success, msg = db.authenticate_user(u, p)
-                    if success:
-                        sock.sendall(b"AUTH_SUCCESS: Autenticacion exitosa. Ya puedes chatear con /all <mensaje>.")
-                        clientes_activos[sock] = u
-                        print(f"[AUTH OK] {u} ha entrado al chat.")
-                        broadcast(f"[SISTEMA] {u} se ha unido al chat.")
+                    # Comprobar si ya hay un usuario activo con el mismo nombre
+                    if u in clientes_activos.values():
+                        sock.sendall(b"AUTH_FAIL: El usuario ya ha iniciado sesion desde otro cliente.")
                     else:
-                        sock.sendall(f"AUTH_FAIL: {msg}".encode('utf-8'))
+                        success, msg = db.authenticate_user(u, p)
+                        if success:
+                            sock.sendall(b"AUTH_SUCCESS: Autenticacion exitosa. Ya puedes chatear con /all <mensaje>.")
+                            clientes_activos[sock] = u
+                            print(f"[AUTH OK] {u} ha entrado al chat.")
+                            broadcast(f"[SISTEMA] {u} se ha unido al chat.")
+                        else:
+                            sock.sendall(f"AUTH_FAIL: {msg}".encode('utf-8'))
                 else:
                     sock.sendall(b"ERROR: Formato incorrecto. Uso: /login <usuario> <password>")
             elif mensaje == '/salir':
@@ -140,8 +167,8 @@ def iniciar_servidor():
                     client_socket, addr = server_socket.accept()
                     print(f"[NUEVA CONEXIÓN] {addr} conectando...")
                     sockets_conectados.append(client_socket)
-                    # Enviar mensaje automático de autenticación obligatorio al conectar
-                    client_socket.sendall(b"AUTH_REQ: Bienvenido. Por favor ingresa /login <user> <pass> o /register <user> <pass>")
+                    # Enviar mensaje automático de autenticación obligatorio al conectar usando la función auth
+                    auth(client_socket)
                 else:
                     # Es un socket de cliente enviando datos
                     manejar_datos_cliente(sock)
